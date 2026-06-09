@@ -71,6 +71,7 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_SUPPORT_OP,
     RPC_CMD_COUNT,
 };
 
@@ -103,6 +104,16 @@ struct rpc_msg_get_alloc_size_req {
 
 struct rpc_msg_get_alloc_size_rsp {
     uint64_t alloc_size;
+};
+
+struct rpc_msg_support_op_req {
+    uint32_t   device;
+    rpc_tensor op;
+    rpc_tensor srcs[GGML_MAX_SRC];
+};
+
+struct rpc_msg_support_op_rsp {
+    uint8_t supported;
 };
 
 struct rpc_msg_init_tensor_req {
@@ -839,6 +850,7 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+    bool support_op(const rpc_msg_support_op_req & request, rpc_msg_support_op_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
 
     struct stored_graph {
@@ -906,6 +918,36 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
 
     response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
 
+    return true;
+}
+
+bool rpc_server::support_op(const rpc_msg_support_op_req & request, rpc_msg_support_op_rsp & response) {
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        return false;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead()*(1 + GGML_MAX_SRC),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * op = deserialize_tensor(ctx, &request.op);
+    if (op == nullptr) {
+        GGML_LOG_ERROR("Null op tensor passed to server support_op function.\n");
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (request.srcs[i].id != 0) {
+            op->src[i] = deserialize_tensor(ctx, &request.srcs[i]);
+        }
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+    response.supported = (dev != nullptr && ggml_backend_dev_supports_op(dev, op)) ? 1 : 0;
     return true;
 }
 
@@ -1517,6 +1559,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORT_OP: {
+                rpc_msg_support_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_support_op_rsp response;
+                if (!server.support_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_ALIGNMENT: {
                 rpc_msg_get_alignment_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -1820,10 +1876,23 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto sock = get_socket(dev_ctx->endpoint);
+
+    rpc_msg_support_op_req request = {
+        /*.device =*/ dev_ctx->device,
+        /*.op     =*/ serialize_tensor(op),
+        /*.srcs   =*/ {},
+    };
+    // supports_op may depend on the op's srcs (e.g. src[0]->ne[0]), so serialize them too
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        request.srcs[i] = serialize_tensor(op->src[i]);
+    }
+
+    rpc_msg_support_op_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_SUPPORT_OP, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    return response.supported;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
