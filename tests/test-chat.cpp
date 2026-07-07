@@ -3211,6 +3211,41 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     {
+        // VibeThinker-3B (Qwen2-style template, reasoning model emits <think> tags)
+        auto tst = peg_tester("models/templates/WeiboAI-VibeThinker-3B.jinja");
+
+        tst.test(R"(<think>
+I'm thinking
+</think>
+
+Hello, world!)")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, world!", "I'm thinking"))
+            .run();
+
+        tst.test(R"(Hello, world!)")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, world!"))
+            .run();
+
+        tst.test(R"(<think>
+I'm thinking
+</think>
+
+Hello, world!)")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_content(R"(<think>
+I'm thinking
+</think>
+
+Hello, world!)")
+            .run();
+    }
+
+    {
         // Qwen-QwQ-32B (reasoning model)
         auto tst = peg_tester("models/templates/Qwen-QwQ-32B.jinja");
 
